@@ -1,5 +1,3 @@
-module go-grpc-service
+module github.com/skylerblue333/go-grpc-service
 
 go 1.21
-
-require google.golang.org/grpc v1.59.0

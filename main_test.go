@@ -1,18 +1,26 @@
 package main
+
 import (
-    "net/http"
-    "net/http/httptest"
-    "testing"
+	"context"
+	"testing"
 )
-func TestHealthCheck(t *testing.T) {
-    req, err := http.NewRequest("GET", "/health", nil)
-    if err != nil {
-        t.Fatal(err)
-    }
-    rr := httptest.NewRecorder()
-    handler := http.HandlerFunc(handler)
-    handler.ServeHTTP(rr, req)
-    if status := rr.Code; status != http.StatusOK {
-        t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
-    }
+
+func TestSayHello(t *testing.T) {
+	svc := &GreeterService{}
+
+	resp, err := svc.SayHello(context.Background(), GreetRequest{Name: "World"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Message != "Hello, World!" {
+		t.Errorf("unexpected message: %s", resp.Message)
+	}
+}
+
+func TestSayHelloEmptyName(t *testing.T) {
+	svc := &GreeterService{}
+	_, err := svc.SayHello(context.Background(), GreetRequest{Name: ""})
+	if err == nil {
+		t.Error("expected error for empty name")
+	}
 }
