@@ -1,26 +1,39 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
-func TestSayHello(t *testing.T) {
-	svc := &GreeterService{}
+func TestHealth(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/health", nil)
+	rr := httptest.NewRecorder()
+	handleHealth(rr, req)
 
-	resp, err := svc.SayHello(context.Background(), GreetRequest{Name: "World"})
-	if err != nil {
-		t.Fatal(err)
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", rr.Code)
 	}
-	if resp.Message != "Hello, World!" {
-		t.Errorf("unexpected message: %s", resp.Message)
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp["status"] != "ok" {
+		t.Errorf("Expected status 'ok', got %v", resp["status"])
 	}
 }
 
-func TestSayHelloEmptyName(t *testing.T) {
-	svc := &GreeterService{}
-	_, err := svc.SayHello(context.Background(), GreetRequest{Name: ""})
-	if err == nil {
-		t.Error("expected error for empty name")
+func TestProcess(t *testing.T) {
+	initial := state.Processed
+	req, _ := http.NewRequest("POST", "/process", nil)
+	rr := httptest.NewRecorder()
+	handleProcess(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("Expected 202 Accepted, got %d", rr.Code)
+	}
+
+	if state.Processed != initial+1 {
+		t.Errorf("Expected state to increment")
 	}
 }

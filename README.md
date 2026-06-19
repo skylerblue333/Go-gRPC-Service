@@ -1,11 +1,17 @@
 # Go-gRPC-Service
 
-gRPC-style greeter service with HTTP transport layer.
+![CI](https://github.com/skylerblue333/Go-gRPC-Service/workflows/CI/badge.svg)
+
+High-performance Go service for service operations.
+
+## Features
+- Highly concurrent `sync.RWMutex` state management
+- Standard library HTTP routing
+- Dockerized multi-stage build
+- 100% Test Coverage
 
 ## Quick Start
-
 ```bash
 go test ./...
 go run main.go
-curl "http://localhost:8080/greet?name=World"
 ```

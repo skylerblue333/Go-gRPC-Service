@@ -1,50 +1,52 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
+	"sync"
+	"time"
 )
 
-// Simplified gRPC-style service without proto dependency for portability
-type GreetRequest struct {
-	Name string
+type ServiceState struct {
+	mu        sync.RWMutex
+	Processed int
+	Domain    string
 }
 
-type GreetResponse struct {
-	Message string
+var state = &ServiceState{Domain: "service"}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"domain":    state.Domain,
+		"processed": state.Processed,
+	})
 }
 
-type GreeterService struct{}
-
-func (g *GreeterService) SayHello(ctx context.Context, req GreetRequest) (GreetResponse, error) {
-	if req.Name == "" {
-		return GreetResponse{}, fmt.Errorf("name cannot be empty")
-	}
-	return GreetResponse{Message: "Hello, " + req.Name + "!"}, nil
+func handleProcess(w http.ResponseWriter, r *http.Request) {
+	state.mu.Lock()
+	state.Processed++
+	state.mu.Unlock()
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprint(w, `{"status":"processing"}`)
 }
 
 func main() {
-	svc := &GreeterService{}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/process", handleProcess)
 
-	mux.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
-		name := r.URL.Query().Get("name")
-		resp, err := svc.SayHello(r.Context(), GreetRequest{Name: name})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		fmt.Fprint(w, resp.Message)
-	})
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"status":"ok"}`)
-	})
-
-	ln, _ := net.Listen("tcp", ":8080")
-	log.Println("gRPC-style service on :8080")
-	log.Fatal(http.Serve(ln, mux))
+	log.Println("Server starting on :8080")
+	log.Fatal(server.ListenAndServe())
 }
