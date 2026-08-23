@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -64,6 +65,30 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 		maxConcurrent: maxConcurrent,
 		authToken:     strings.TrimSpace(os.Getenv("RPC_AUTH_TOKEN")),
 	}, nil
+}
+
+func healthcheckURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://127.0.0.1:8080/healthz"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s/healthz", net.JoinHostPort(host, port))
+}
+
+func runHealthcheck() error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	response, err := client.Get(healthcheckURL(env("HTTP_ADDR", ":8080")))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("health endpoint returned %s", response.Status)
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {
@@ -144,6 +169,14 @@ func newGRPCServer(maxConcurrent int64, auth tokenAuthorizer, state *ServiceStat
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
+		if err := runHealthcheck(); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg, err := loadRuntimeConfig()
 	if err != nil {
 		log.Fatal(err)
