@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -27,25 +29,77 @@ const serviceName = "sky-rpc-core"
 
 type ServiceState struct {
 	processed atomic.Uint64
+	rejected  atomic.Uint64
 	started   time.Time
+}
+
+type runtimeConfig struct {
+	grpcAddr      string
+	httpAddr      string
+	maxConcurrent int64
+	authToken     string
 }
 
 func newState() *ServiceState { return &ServiceState{started: time.Now()} }
 
 func env(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return fallback
 }
 
+func loadRuntimeConfig() (runtimeConfig, error) {
+	maxConcurrent, err := strconv.ParseInt(env("MAX_CONCURRENT_RPCS", "256"), 10, 64)
+	if err != nil || maxConcurrent < 1 || maxConcurrent > 100000 {
+		return runtimeConfig{}, errors.New("MAX_CONCURRENT_RPCS must be an integer between 1 and 100000")
+	}
+	grpcAddr := env("GRPC_ADDR", ":9090")
+	httpAddr := env("HTTP_ADDR", ":8080")
+	if grpcAddr == httpAddr {
+		return runtimeConfig{}, errors.New("GRPC_ADDR and HTTP_ADDR must be different")
+	}
+	return runtimeConfig{
+		grpcAddr:      grpcAddr,
+		httpAddr:      httpAddr,
+		maxConcurrent: maxConcurrent,
+		authToken:     strings.TrimSpace(os.Getenv("RPC_AUTH_TOKEN")),
+	}, nil
+}
+
+func healthcheckURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://127.0.0.1:8080/healthz"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s/healthz", net.JoinHostPort(host, port))
+}
+
+func runHealthcheck() error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	response, err := client.Get(healthcheckURL(env("HTTP_ADDR", ":8080")))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("health endpoint returned %s", response.Status)
+	}
+	return nil
+}
+
 func writeJSON(w http.ResponseWriter, code int, value any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func newHTTPHandler(state *ServiceState) http.Handler {
+func newHTTPHandler(state *ServiceState, auth tokenAuthorizer) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": serviceName})
@@ -56,29 +110,42 @@ func newHTTPHandler(state *ServiceState) http.Handler {
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"processed":      state.processed.Load(),
+			"rejected":       state.rejected.Load(),
 			"uptime_seconds": int64(time.Since(state.started).Seconds()),
 		})
 	})
 	mux.HandleFunc("POST /v1/process", func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > 1<<20 {
+			state.rejected.Add(1)
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "payload too large"})
 			return
 		}
 		state.processed.Add(1)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "processed": state.processed.Load()})
 	})
-	return mux
+	return auth.httpMiddleware(mux)
 }
 
-func unaryInterceptor(maxConcurrent int64, inFlight *atomic.Int64) grpc.UnaryServerInterceptor {
+func unaryInterceptor(maxConcurrent int64, inFlight *atomic.Int64, auth tokenAuthorizer, state *ServiceState) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if info.FullMethod != "/grpc.health.v1.Health/Check" && info.FullMethod != "/grpc.health.v1.Health/Watch" {
+			if err := auth.authorizeContext(ctx); err != nil {
+				state.rejected.Add(1)
+				return nil, err
+			}
+		}
 		current := inFlight.Add(1)
 		defer inFlight.Add(-1)
 		if current > maxConcurrent {
+			state.rejected.Add(1)
 			return nil, status.Error(codes.ResourceExhausted, "server concurrency limit reached")
 		}
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			if values := md.Get("x-request-id"); len(values) > 0 && len(values[0]) > 128 {
+			if values := md.Get("x-request-id"); len(values) > 1 {
+				state.rejected.Add(1)
+				return nil, status.Error(codes.InvalidArgument, "multiple x-request-id values")
+			} else if len(values) == 1 && len(values[0]) > 128 {
+				state.rejected.Add(1)
 				return nil, status.Error(codes.InvalidArgument, "x-request-id too long")
 			}
 		}
@@ -86,13 +153,13 @@ func unaryInterceptor(maxConcurrent int64, inFlight *atomic.Int64) grpc.UnarySer
 	}
 }
 
-func newGRPCServer(maxConcurrent int64) *grpc.Server {
+func newGRPCServer(maxConcurrent int64, auth tokenAuthorizer, state *ServiceState) *grpc.Server {
 	var inFlight atomic.Int64
 	server := grpc.NewServer(
 		grpc.MaxRecvMsgSize(1<<20),
 		grpc.MaxSendMsgSize(1<<20),
 		grpc.ConnectionTimeout(5*time.Second),
-		grpc.UnaryInterceptor(unaryInterceptor(maxConcurrent, &inFlight)),
+		grpc.UnaryInterceptor(unaryInterceptor(maxConcurrent, &inFlight, auth, state)),
 	)
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
@@ -102,18 +169,28 @@ func newGRPCServer(maxConcurrent int64) *grpc.Server {
 }
 
 func main() {
-	state := newState()
-	maxConcurrent, err := strconv.ParseInt(env("MAX_CONCURRENT_RPCS", "256"), 10, 64)
-	if err != nil || maxConcurrent < 1 {
-		log.Fatal("MAX_CONCURRENT_RPCS must be a positive integer")
+	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
+		if err := runHealthcheck(); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
 	}
 
-	grpcAddr := env("GRPC_ADDR", ":9090")
-	httpAddr := env("HTTP_ADDR", ":8080")
-	grpcServer := newGRPCServer(maxConcurrent)
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	state := newState()
+	auth := newTokenAuthorizer(cfg.authToken)
+	if !auth.enabled() {
+		log.Print("warning: RPC_AUTH_TOKEN is unset; non-health surfaces are unauthenticated")
+	}
+
+	grpcServer := newGRPCServer(cfg.maxConcurrent, auth, state)
 	httpServer := &http.Server{
-		Addr:              httpAddr,
-		Handler:           newHTTPHandler(state),
+		Addr:              cfg.httpAddr,
+		Handler:           newHTTPHandler(state, auth),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -121,19 +198,19 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	grpcListener, err := net.Listen("tcp", grpcAddr)
+	grpcListener, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
 		log.Fatalf("gRPC listen: %v", err)
 	}
 
 	go func() {
-		log.Printf("gRPC listening on %s", grpcAddr)
+		log.Printf("gRPC listening on %s", cfg.grpcAddr)
 		if err := grpcServer.Serve(grpcListener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			log.Printf("gRPC server stopped: %v", err)
 		}
 	}()
 	go func() {
-		log.Printf("HTTP operations API listening on %s", httpAddr)
+		log.Printf("HTTP operations API listening on %s", cfg.httpAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server stopped: %v", err)
 		}

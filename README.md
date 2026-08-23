@@ -1,19 +1,37 @@
-# Go gRPC Service
+# Sky RPC Core
 
-A production-oriented Go service boundary with a real gRPC runtime, standard gRPC health checking, server reflection for development tooling, graceful shutdown, and an HTTP compatibility surface.
+Sky RPC Core is a compact Go service-runtime product for internal RPC workloads. It provides a real `google.golang.org/grpc` server, standard gRPC health semantics, reflection for development tooling, a small HTTP operations surface, optional bearer authentication, bounded concurrency, graceful shutdown, and hardened container packaging.
 
-> **SkyCoin4444 / IITR infrastructure component:** intended as a reusable service boundary for typed internal APIs, protocol services, and gateway-to-backend communication.
+> **Status:** productization branch under exact-head CI verification. It is a service foundation, not a fabricated business-domain API.
 
 ## Runtime surfaces
 
-| Surface | Address | Purpose |
-|---|---|---|
-| gRPC | `:9090` | Native service-to-service transport, health, reflection |
-| HTTP | `:8080` | Compatibility/diagnostic endpoints |
-| HTTP health | `GET /health` | Service status and processed counter |
-| HTTP process | `POST /process` | Example accepted-work path |
+| Surface | Default address | Purpose |
+|---|---:|---|
+| gRPC | `:9090` | native service-to-service transport, health, reflection |
+| HTTP | `:8080` | health/readiness, metrics, compatibility processing |
+| HTTP health | `GET /healthz` | liveness |
+| HTTP readiness | `GET /readyz` | readiness |
+| HTTP metrics | `GET /metrics` | processed/rejected/uptime counters |
+| HTTP process | `POST /v1/process` | bounded example work-acceptance surface |
 
-The gRPC runtime currently exposes the standard gRPC health service and reflection. Business RPC contracts should be added as `.proto` APIs rather than pretending the existing HTTP handlers are gRPC methods.
+The gRPC runtime currently exposes the standard health service and reflection. Real application RPCs should be defined as versioned `.proto` contracts rather than pretending the example HTTP handler is a business gRPC method.
+
+## Security controls
+
+- Go 1.25.13 baseline;
+- `google.golang.org/grpc` 1.82.1;
+- 1 MiB maximum gRPC send/receive size;
+- 1 MiB HTTP process-payload limit;
+- configurable maximum concurrent unary RPCs;
+- optional constant-time bearer authentication through `RPC_AUTH_TOKEN`;
+- duplicate/oversized `x-request-id` rejection;
+- HTTP read/write/header/idle timeouts;
+- health/readiness remain available for orchestration without credentials;
+- graceful HTTP and gRPC shutdown;
+- non-root distroless runtime image.
+
+See `SECURITY.md` for the exact threat model and limitations.
 
 ## Quick start
 
@@ -21,56 +39,86 @@ The gRPC runtime currently exposes the standard gRPC health service and reflecti
 go mod download
 go test -race ./...
 go vet ./...
+export RPC_AUTH_TOKEN="$(openssl rand -hex 32)"
 go run .
 ```
 
-The service shuts down gracefully on `SIGINT` and `SIGTERM`.
+Check health:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+Authenticated HTTP operation:
+
+```bash
+curl -i \
+  -H "Authorization: Bearer $RPC_AUTH_TOKEN" \
+  -X POST \
+  http://127.0.0.1:8080/v1/process
+```
+
+The service also includes a built-in container health check:
+
+```bash
+./sky-rpc-core --healthcheck
+```
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_ADDR` | `:9090` | gRPC listen address |
+| `HTTP_ADDR` | `:8080` | HTTP operations listen address |
+| `MAX_CONCURRENT_RPCS` | `256` | unary-RPC ceiling, range `1..100000` |
+| `RPC_AUTH_TOKEN` | unset | bearer token for non-health HTTP/gRPC surfaces |
+
+The process warns if the auth token is unset. The packaged Compose deployment requires it.
+
+## Container
+
+```bash
+export RPC_AUTH_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build
+```
+
+The Compose package binds both ports to localhost by default, runs a read-only root filesystem, drops Linux capabilities, enables `no-new-privileges`, and uses the built-in `/healthz` probe.
 
 ## Architecture
 
 ```text
-                    +--------------------+
-                    |   SkyCoin / Client |
-                    +---------+----------+
-                              |
-                +-------------+-------------+
-                |                           |
-             gRPC :9090                 HTTP :8080
-                |                           |
-        +-------v--------+           +------v-------+
-        | gRPC health +  |           | compatibility |
-        | reflection     |           | handlers      |
-        +-------+--------+           +------+--------+
-                |                           |
-                +-------------+-------------+
-                              |
+                         clients/services
+                               |
+               +---------------+---------------+
+               |                               |
+            gRPC :9090                       HTTP :8080
+               |                               |
+      auth + concurrency guard          auth + payload guard
+               |                               |
+      gRPC health/reflection       health/readiness/metrics/process
+               |                               |
+               +---------------+---------------+
+                               |
                          ServiceState
-                              |
+                               |
                          graceful stop
 ```
 
-## Why this is materially stronger
-
-The repository now contains an actual gRPC server rather than only an HTTP server with a gRPC-themed README. It uses the maintained `google.golang.org/grpc` implementation, standard health semantics, reflection, bounded HTTP timeouts, synchronized state access, and graceful shutdown.
-
-## Institutional integration path
-
-The service is suitable as a foundation for:
-
-1. typed internal RPC contracts;
-2. gateway-to-service communication;
-3. health-aware service discovery;
-4. load-balancer backends;
-5. SkyCoin protocol adapters;
-6. telemetry and SLO instrumentation;
-7. tenant-aware service quotas;
-8. authenticated/mTLS service transport;
-9. SDK-generated client libraries;
-10. managed enterprise service deployments;
-11. support, maintenance, and integration services.
-
-These are product/value surfaces, not claims of current revenue or customer adoption.
-
 ## Verification
 
-GitHub Actions runs formatting checks, `go vet`, race-detector tests, module download, and `govulncheck` on every push and pull request.
+GitHub Actions is configured to run:
+
+- module resolution and verification;
+- `gofmt` enforcement;
+- `go vet`;
+- unit/behavior tests;
+- race-detector tests;
+- `govulncheck`;
+- binary build;
+- Docker image build.
+
+A branch is not treated as complete until the exact PR head passes those gates.
+
+## Product boundary
+
+Sky RPC Core does **not** currently claim mTLS/SPIFFE identity, OIDC/JWT verification, tenant RBAC/ABAC, persistent queues, distributed tracing, exactly-once execution, production capacity figures, or an SLA. See `PRODUCT.md` for commercial extension paths.
