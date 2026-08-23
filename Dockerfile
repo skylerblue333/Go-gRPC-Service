@@ -1,10 +1,12 @@
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
+FROM golang:1.25.13-alpine AS builder
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/sky-rpc-core .
 
-FROM alpine:latest
-WORKDIR /app
-COPY --from=builder /app/server .
-EXPOSE 8080
-CMD ["./server"]
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/sky-rpc-core /sky-rpc-core
+EXPOSE 8080 9090
+USER nonroot:nonroot
+ENTRYPOINT ["/sky-rpc-core"]
